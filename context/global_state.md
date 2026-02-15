@@ -13,5 +13,6 @@
 - 프로토콜 파일 생성: CLAUDE.md, GEMINI.md, _TEMPLATE_SKILL.md
 
 ## 🔜 Next Immediate Steps (To-Do)
-- [ ] 첫 번째 에이전트 생성 (예: Market Analyst, Risk Manager 등)
-- [ ] 투자 전략 수립 및 초기 자본금 설정
+- [x] 첫 번째 에이전트 'market-analyst' 생성 완료 (US/KR 시장 분석 특화).
+- [ ] 투자 전략 수립 및 Quant 에이전트 생성 필요.
+
