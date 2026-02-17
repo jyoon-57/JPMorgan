@@ -39,3 +39,4 @@ __pycache__/
 *.pyo
 .venv/
 last_hour_orders.json
+logs/

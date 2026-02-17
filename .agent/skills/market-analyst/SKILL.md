@@ -32,10 +32,29 @@ input:
 3. **주도 섹터 (Leading Sector):**
    - 금일 상승률 상위 섹터 및 대장주 식별.
 
+## 입력 데이터 형식 (JSON)
+
+KIS Collector에서 수집된 구조화된 데이터가 입력됩니다.
+
+```json
+{
+  "indices": {
+    "KOSPI": { "price": ..., "change": ... },
+    "KOSDAQ": { "price": ..., "change": ... }
+  },
+  "investors": {
+    "KOSPI": { "foreign": ..., "institution": ... }
+  },
+  "exchange_rate": 1350.0
+}
+```
+
+위 데이터를 해석하여 시장의 방향성(Bull/Bear)을 판단하세요.
+
 ## 출력 형식 (Strict)
 
 반드시 다음 형식을 준수하여 출력하세요.
 
 - **Market Sentiment:** (0~100점, 50점 기준 Bull/Bear)
 - **Key Insight:** (현재 시장 상황 한 줄 요약)
-- **Hot Sector:** (현재 가장 강한 섹터 및 대장주)
+- **Hot Sector:** (현재 가장 강한 섹터 및 대장주 - 검색 결과 활용)

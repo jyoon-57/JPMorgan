@@ -1,0 +1,14 @@
+google-genai
+
+finance-datareader
+schedule
+python-dotenv
+requests
+matplotlib
+plotly
+multipledispatch
+deprecated
+beautifulsoup4
+lxml
+tqdm
+tenacity

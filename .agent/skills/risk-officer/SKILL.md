@@ -2,6 +2,8 @@
 name: risk-officer
 description: Quant Strategist의 주문서를 검수(리스크 관리)하고, CEO가 즉시 실행할 수 있는 텔레그램 메시지 포맷으로 변환합니다.
 version: 2.2.0 (KRX-Standard)
+tools:
+  - google_search
 input:
   properties:
     proposed_orders:

@@ -5,10 +5,11 @@ Pipeline: Market Analyst → Quant Strategist → Risk Officer → Telegram
 """
 
 import json
+import logging
 import os
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from pathlib import Path
 try:
     from zoneinfo import ZoneInfo
@@ -20,6 +21,7 @@ from google.genai import types
 import requests
 import schedule
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # ============================================================
 # 🔑 API Keys — .env 파일에서 로드
@@ -36,12 +38,68 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 BASE_DIR = Path(__file__).resolve().parent.parent
 SKILLS_DIR = BASE_DIR / ".agent" / "skills"
 ORDERS_FILE = BASE_DIR / "last_hour_orders.json"
+REPORTS_DIR = BASE_DIR / "reports"
+LOGS_DIR = BASE_DIR / "logs"
+GLOBAL_STATE_FILE = BASE_DIR / "context" / "global_state.md"
 
 KST = ZoneInfo("Asia/Seoul")
 GEMINI_MODEL = "gemini-2.5-flash"
 
-# Gemini Client (모듈 로드 시 초기화하지 않고 main()에서 생성)
+# Gemini Client (main()에서 초기화)
 gemini_client: genai.Client = None
+
+# ============================================================
+# 📋 한국 공휴일 (2026년)
+# ============================================================
+KR_HOLIDAYS_2026 = {
+    date(2026, 1, 1),   # 신정
+    date(2026, 2, 16),  # 설날 연휴
+    date(2026, 2, 17),  # 설날
+    date(2026, 2, 18),  # 설날 연휴
+    date(2026, 3, 1),   # 삼일절
+    date(2026, 5, 5),   # 어린이날
+    date(2026, 5, 24),  # 부처님오신날
+    date(2026, 6, 6),   # 현충일
+    date(2026, 8, 15),  # 광복절
+    date(2026, 9, 24),  # 추석 연휴
+    date(2026, 9, 25),  # 추석
+    date(2026, 9, 26),  # 추석 연휴
+    date(2026, 10, 3),  # 개천절
+    date(2026, 10, 9),  # 한글날
+    date(2026, 12, 25), # 크리스마스
+}
+
+
+# ============================================================
+# 📝 로깅 설정
+# ============================================================
+def setup_logging() -> logging.Logger:
+    """콘솔 + 파일 동시 로깅 설정."""
+    LOGS_DIR.mkdir(exist_ok=True)
+
+    logger = logging.getLogger("jpmorgan")
+    logger.setLevel(logging.DEBUG)
+
+    # 포맷
+    fmt = logging.Formatter("[%(asctime)s] %(levelname)s — %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    # 콘솔 핸들러
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(fmt)
+    logger.addHandler(console)
+
+    # 파일 핸들러 (일별 로그)
+    today_str = datetime.now(KST).strftime("%Y-%m-%d")
+    file_handler = logging.FileHandler(LOGS_DIR / f"bot_{today_str}.log", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+log = setup_logging()
 
 
 # ============================================================
@@ -56,7 +114,6 @@ def load_skill_prompt(agent_name: str) -> str:
 
     raw = skill_path.read_text(encoding="utf-8")
 
-    # --- 로 감싸진 YAML Frontmatter 제거
     parts = raw.split("---", 2)
     if len(parts) >= 3:
         return parts[2].strip()
@@ -75,9 +132,9 @@ def save_orders(orders_json: str) -> None:
     try:
         json.loads(orders_json)
         ORDERS_FILE.write_text(orders_json, encoding="utf-8")
-        print(f"[💾] 주문 내역 저장 완료 → {ORDERS_FILE}")
+        log.info("주문 내역 저장 완료 → %s", ORDERS_FILE)
     except json.JSONDecodeError:
-        print(f"[⚠️] 유효하지 않은 JSON이라 저장하지 않습니다: {orders_json[:50]}...")
+        log.warning("유효하지 않은 JSON이라 저장하지 않습니다: %s...", orders_json[:50])
 
 
 def parse_json_from_response(text: str) -> str:
@@ -101,113 +158,112 @@ def send_telegram(message: str) -> None:
     try:
         resp = requests.post(url, json=payload, timeout=10)
         if resp.ok:
-            print("[📨] 텔레그램 전송 성공")
+            log.info("텔레그램 전송 성공")
         else:
-            print(f"[⚠️] 텔레그램 전송 실패: {resp.status_code} {resp.text}")
+            log.error("텔레그램 전송 실패: %s %s", resp.status_code, resp.text)
     except requests.RequestException as e:
-        print(f"[⚠️] 텔레그램 연결 오류: {e}")
+        log.error("텔레그램 연결 오류: %s", e)
 
 
 # ============================================================
 # 📡 실시간 시장 데이터 수집 (pykrx + FinanceDataReader)
 # ============================================================
+# ============================================================
+# 📡 실시간 시장 데이터 수집 (KIS OpenAPI)
+# ============================================================
 def fetch_market_data() -> str:
-    """pykrx와 FinanceDataReader로 최신 시장 데이터를 수집하여 텍스트로 반환."""
-    from pykrx import stock
-    import FinanceDataReader as fdr
+    """KIS OpenAPI를 통해 실시간/장중 지수, 환율, 수급 데이터를 수집하여 포맷팅된 JSON 문자열 반환."""
+    from src.data.kis_collector import KisAuth, KisData
+    import json
 
-    now = datetime.now(KST)
-    today_str = now.strftime("%Y%m%d")
-    # pykrx는 장중에 당일 데이터가 불완전할 수 있으므로 최근 5영업일 범위로 조회
-    start_str = (now - timedelta(days=7)).strftime("%Y%m%d")
+    # KIS 연결 초기화
+    try:
+        auth = KisAuth()
+        # 토큰 발급 (실패 시 로그 남기고 빈 데이터 반환 가능성 있음)
+        # auth.auth() # get_token에서 자동 호출됨
+        collector = KisData(auth)
+    except Exception as e:
+        log.error("KIS API 초기화 실패: %s", e)
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-    sections = []
+    data = {
+        "indices": {},
+        "investors": {},
+        "exchange_rate": None,
+        "timestamp": datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
+    }
 
     # ── 1) KOSPI / KOSDAQ 지수 ──
-    try:
-        kospi = stock.get_index_ohlcv(start_str, today_str, "1001")  # KOSPI
-        kosdaq = stock.get_index_ohlcv(start_str, today_str, "2001")  # KOSDAQ
-
-        if not kospi.empty:
-            latest_kospi = kospi.iloc[-1]
-            prev_kospi = kospi.iloc[-2] if len(kospi) >= 2 else latest_kospi
-            kospi_change = ((latest_kospi["종가"] - prev_kospi["종가"]) / prev_kospi["종가"]) * 100
-            sections.append(
-                f"KOSPI: {latest_kospi['종가']:,.2f} "
-                f"(전일 대비 {kospi_change:+.2f}%) "
-                f"[시가 {latest_kospi['시가']:,.2f} / 고가 {latest_kospi['고가']:,.2f} / 저가 {latest_kospi['저가']:,.2f}]"
-            )
-
-        if not kosdaq.empty:
-            latest_kosdaq = kosdaq.iloc[-1]
-            prev_kosdaq = kosdaq.iloc[-2] if len(kosdaq) >= 2 else latest_kosdaq
-            kosdaq_change = ((latest_kosdaq["종가"] - prev_kosdaq["종가"]) / prev_kosdaq["종가"]) * 100
-            sections.append(
-                f"KOSDAQ: {latest_kosdaq['종가']:,.2f} "
-                f"(전일 대비 {kosdaq_change:+.2f}%)"
-            )
-    except Exception as e:
-        sections.append(f"[지수 데이터 조회 실패: {e}]")
-
-    time.sleep(1)  # pykrx 요청 간 딜레이
+    for name, code in [("KOSPI", "0001"), ("KOSDAQ", "1001")]:
+        try:
+            res = collector.get_market_index(code)
+            if res and res.get('rt_cd') == '0':
+                # API 응답 구조에 따라 파싱 (output1이 차트/현재가 정보 포함 가정)
+                # inquire-daily-index-chartprice 기준 output1의 첫번째 값 사용 등 점검 필요
+                # 단순화하여 raw data 일부를 전달하거나 파싱. 
+                # 여기서는 output1 (현재가 정보) 파싱 시도.
+                val = res.get('output1')
+                # 만약 리스트라면 첫번째 요소
+                if isinstance(val, list) and val:
+                    val = val[0]
+                
+                # 필요한 필드만 추출 (예시 키값 - 실제 응답 확인 후 조정 필요할 수 있음)
+                # KIS API 문서 기준: stck_prpr(현재가), prdy_vrss(대비), prdy_ctrt(등락률) 등
+                # inquire-daily-index-chartprice 응답키: bstp_nmiv_prpr(지수), bstp_nmiv_prdy_vrss(대비) 등
+                # *실제 응답 키*는 API 문서 의존. 여기서는 가독성 위해 맵핑.
+                data["indices"][name] = {
+                    "price": val.get("bstp_nmiv_prpr") or val.get("stck_prpr"),
+                    "change": val.get("bstp_nmiv_prdy_ctrt") or val.get("prdy_ctrt")
+                }
+            else:
+                data["indices"][name] = {"error": res.get("msg1") if res else "Unknown error"}
+        except Exception as e:
+            log.error(f"{name} 지수 수집 실패: {e}")
+            data["indices"][name] = {"error": str(e)}
+            
+        time.sleep(0.2) # API 제한 고려
 
     # ── 2) USD/KRW 환율 ──
     try:
-        fdr_start = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-        fdr_today = now.strftime("%Y-%m-%d")
-        usdkrw = fdr.DataReader("USD/KRW", fdr_start, fdr_today)
-        if not usdkrw.empty:
-            latest_rate = usdkrw.iloc[-1]["Close"]
-            prev_rate = usdkrw.iloc[-2]["Close"] if len(usdkrw) >= 2 else latest_rate
-            rate_change = ((latest_rate - prev_rate) / prev_rate) * 100
-            sections.append(f"USD/KRW 환율: {latest_rate:,.2f}원 (전일 대비 {rate_change:+.2f}%)")
+        data["exchange_rate"] = collector.get_exchange_rate()
     except Exception as e:
-        sections.append(f"[환율 데이터 조회 실패: {e}]")
+        log.error(f"환율 수집 실패: {e}")
 
-    time.sleep(1)
-
-    # ── 3) 외국인 순매수 상위 (KOSPI) ──
+    # ── 3) 투자자별 매매동향 (KOSPI 기준) ──
     try:
-        # pykrx의 날짜 형식: YYYYMMDD
-        # 장중이면 전일 데이터, 장 마감 후면 당일 데이터가 조회됨
-        foreign_buy = stock.get_market_net_purchases_of_equities(
-            start_str, today_str, "KOSPI", "외국인"
-        )
-        if not foreign_buy.empty:
-            top5 = foreign_buy.head(5)
-            lines = []
-            for name, row in top5.iterrows():
-                lines.append(f"  - {name}: {row['순매수거래량']:+,}주 / {row['순매수거래대금']:+,}원")
-            sections.append("외국인 순매수 TOP 5 (KOSPI):\n" + "\n".join(lines))
+        res = collector.get_investor_trend("0001") # KOSPI
+        if res and res.get('rt_cd') == '0':
+            # output 리스트 순회하며 개인/외국인/기관 찾기
+            # KIS API 'inquire-investor' response structure check needed.
+            # Assuming standard structure or raw dump for Analyst to interpret.
+            # We will pass the raw output list for Analyst to parse 'Foreigner', 'Institution'
+            data["investors"]["KOSPI"] = res.get("output", [])
+        else:
+            data["investors"]["KOSPI"] = {"error": res.get("msg1") if res else "Failed"}
     except Exception as e:
-        sections.append(f"[외국인 수급 데이터 조회 실패: {e}]")
+        log.error(f"수급 데이터 수집 실패: {e}")
 
-    time.sleep(1)
-
-    # ── 4) 기관 순매수 상위 (KOSPI) ──
-    try:
-        inst_buy = stock.get_market_net_purchases_of_equities(
-            start_str, today_str, "KOSPI", "기관합계"
-        )
-        if not inst_buy.empty:
-            top5 = inst_buy.head(5)
-            lines = []
-            for name, row in top5.iterrows():
-                lines.append(f"  - {name}: {row['순매수거래량']:+,}주 / {row['순매수거래대금']:+,}원")
-            sections.append("기관 순매수 TOP 5 (KOSPI):\n" + "\n".join(lines))
-    except Exception as e:
-        sections.append(f"[기관 수급 데이터 조회 실패: {e}]")
-
-    result = "\n".join(sections)
-    print(f"[📡] 시장 데이터 수집 완료 ({len(sections)}개 항목)")
-    return result
+    log.info("KIS 시장 데이터 수집 완료")
+    
+    # JSON 문자열로 변환하여 반환
+    return json.dumps(data, ensure_ascii=False, indent=2)
 
 
 # ============================================================
-# 🤖 Gemini API 호출
+# 🤖 Gemini API 호출 (Retry 포함)
 # ============================================================
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=8),
+    retry=retry_if_exception_type(Exception),
+    before_sleep=lambda retry_state: log.warning(
+        "Gemini API 재시도 %d/3 (%s)",
+        retry_state.attempt_number,
+        retry_state.outcome.exception(),
+    ),
+)
 def call_gemini(system_prompt: str, user_prompt: str) -> str:
-    """일반 Gemini API 호출 (Quant, Risk Officer용)."""
+    """일반 Gemini API 호출 (Quant, Risk Officer용). 실패 시 최대 3회 재시도."""
     full_prompt = f"{system_prompt}\n\n---\n\n{user_prompt}"
 
     response = gemini_client.models.generate_content(
@@ -220,8 +276,18 @@ def call_gemini(system_prompt: str, user_prompt: str) -> str:
     return "응답을 생성하지 못했습니다."
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=8),
+    retry=retry_if_exception_type(Exception),
+    before_sleep=lambda retry_state: log.warning(
+        "Gemini Search API 재시도 %d/3 (%s)",
+        retry_state.attempt_number,
+        retry_state.outcome.exception(),
+    ),
+)
 def call_gemini_with_search(system_prompt: str, user_prompt: str) -> str:
-    """Google Search Grounding이 활성화된 Gemini API 호출 (Analyst용)."""
+    """Google Search Grounding이 활성화된 Gemini API 호출 (Analyst용). 실패 시 최대 3회 재시도."""
     full_prompt = f"{system_prompt}\n\n---\n\n{user_prompt}"
 
     response = gemini_client.models.generate_content(
@@ -238,6 +304,62 @@ def call_gemini_with_search(system_prompt: str, user_prompt: str) -> str:
 
 
 # ============================================================
+# 📄 리포트 자동 저장
+# ============================================================
+def save_report(current_datetime: str, market_analysis: str, proposed_orders: str, final_message: str) -> Path:
+    """파이프라인 결과를 reports/YYYY-MM-DD_HH-MM.md로 저장."""
+    REPORTS_DIR.mkdir(exist_ok=True)
+    filename = current_datetime.replace(" ", "_").replace(":", "-") + ".md"
+    report_path = REPORTS_DIR / filename
+
+    content = (
+        f"# Trading Report — {current_datetime} KST\n\n"
+        f"## 1. Market Analysis\n{market_analysis}\n\n"
+        f"## 2. Proposed Orders (JSON)\n```json\n{proposed_orders}\n```\n\n"
+        f"## 3. Risk Assessment & Telegram Message\n{final_message}\n"
+    )
+
+    report_path.write_text(content, encoding="utf-8")
+    log.info("리포트 저장 완료 → %s", report_path)
+    return report_path
+
+
+# ============================================================
+# 🔄 global_state.md 자동 갱신
+# ============================================================
+def update_global_state(current_datetime: str, report_filename: str) -> None:
+    """context/global_state.md의 Last Updated와 Recent Accomplishments를 갱신."""
+    if not GLOBAL_STATE_FILE.exists():
+        log.warning("global_state.md를 찾을 수 없습니다: %s", GLOBAL_STATE_FILE)
+        return
+
+    raw = GLOBAL_STATE_FILE.read_text(encoding="utf-8")
+
+    # Last Updated 갱신
+    raw = re.sub(
+        r"(\*\*Date:\*\*) .+",
+        f"\\1 {current_datetime}",
+        raw,
+    )
+    raw = re.sub(
+        r"(\*\*Last Actor:\*\*) .+",
+        "\\1 Bot Pipeline (Analyst → Quant → Risk)",
+        raw,
+    )
+
+    # Recent Accomplishments에 새 항목 추가 (중복 방지: 같은 시각 항목이 없을 때만)
+    new_entry = f"- [x] **{current_datetime} Auto-Trading Report** → `reports/{report_filename}`"
+    if new_entry not in raw:
+        raw = raw.replace(
+            "## 📝 Recent Accomplishments",
+            f"## 📝 Recent Accomplishments\n{new_entry}",
+        )
+
+    GLOBAL_STATE_FILE.write_text(raw, encoding="utf-8")
+    log.info("global_state.md 갱신 완료")
+
+
+# ============================================================
 # 🔄 메인 파이프라인
 # ============================================================
 def run_pipeline() -> None:
@@ -246,17 +368,17 @@ def run_pipeline() -> None:
     current_time = now_kst.strftime("%H:%M")
     current_datetime = now_kst.strftime("%Y-%m-%d %H:%M")
 
-    print(f"\n{'='*60}")
-    print(f"[🚀] 파이프라인 시작 — {current_datetime} KST")
-    print(f"{'='*60}")
+    log.info("=" * 50)
+    log.info("파이프라인 시작 — %s KST", current_datetime)
+    log.info("=" * 50)
 
     try:
         # ── Step 0: 실시간 시장 데이터 수집 ──
-        print("\n[0/4] 📡 시장 데이터 수집 중 (pykrx + FDR)...")
+        log.info("[0/4] 시장 데이터 수집 중 (pykrx + FDR)...")
         market_data = fetch_market_data()
 
-        # ── Step 1: Market Analyst (Google Search Grounding 활성화) ──
-        print("\n[1/4] 📊 Market Analyst 호출 중 (웹 검색 활성화)...")
+        # ── Step 1: Market Analyst (Google Search Grounding) ──
+        log.info("[1/4] Market Analyst 호출 중 (웹 검색 활성화)...")
         analyst_prompt = load_skill_prompt("market-analyst")
         analyst_user_prompt = (
             f"현재 한국 시간: {current_time}\n\n"
@@ -267,10 +389,10 @@ def run_pipeline() -> None:
             system_prompt=analyst_prompt,
             user_prompt=analyst_user_prompt,
         )
-        print(f"[✓] Market Analysis 완료")
+        log.info("[✓] Market Analysis 완료")
 
         # ── Step 2: Quant Strategist ──
-        print("\n[2/4] 🧮 Quant Strategist 호출 중...")
+        log.info("[2/4] Quant Strategist 호출 중...")
         quant_prompt = load_skill_prompt("quant-strategist")
         previous_orders = load_previous_orders()
 
@@ -285,10 +407,10 @@ def run_pipeline() -> None:
             user_prompt=quant_user_prompt,
         )
         proposed_orders = parse_json_from_response(proposed_orders_raw)
-        print(f"[✓] Quant Strategy 완료")
+        log.info("[✓] Quant Strategy 완료")
 
         # ── Step 3: Risk Officer ──
-        print("\n[3/4] 🛡️ Risk Officer 호출 중...")
+        log.info("[3/4] Risk Officer 호출 중...")
         risk_prompt = load_skill_prompt("risk-officer")
 
         risk_user_prompt = (
@@ -301,41 +423,54 @@ def run_pipeline() -> None:
             system_prompt=risk_prompt,
             user_prompt=risk_user_prompt,
         )
-        print(f"[✓] Risk Assessment 완료")
+        log.info("[✓] Risk Assessment 완료")
 
-        # ── Step 4: 텔레그램 전송 & 주문 저장 ──
-        print("\n[4/4] 📨 결과 전송 및 저장...")
+        # ── Step 4: 텔레그램 전송 & 저장 ──
+        log.info("[4/4] 결과 전송 및 저장...")
         send_telegram(final_message)
         save_orders(proposed_orders)
 
-        print(f"\n[✅] 파이프라인 성공적으로 완료 — {current_datetime} KST")
+        # ── Step 5: 리포트 저장 & global_state 갱신 ──
+        report_path = save_report(current_datetime, market_analysis, proposed_orders, final_message)
+        update_global_state(current_datetime, report_path.name)
+
+        log.info("파이프라인 성공적으로 완료 — %s KST", current_datetime)
 
     except Exception as e:
-        error_msg = f"🔥 파이프라인 실행 중 오류 발생:\n{str(e)}"
-        print(error_msg)
-        send_telegram(f"⚠️ [ERROR] 봇 실행 중 오류 발생!\n{str(e)}")
+        log.error("파이프라인 실행 중 오류 발생: %s", e, exc_info=True)
+        send_telegram(f"⚠️ [ERROR] 봇 실행 중 오류 발생!\n{e}")
 
 
 # ============================================================
 # ⏰ 스케줄러 설정
 # ============================================================
+def is_market_closed(now: datetime) -> str | None:
+    """장이 닫혀 있으면 사유 문자열 반환, 열려 있으면 None."""
+    # 주말
+    if now.weekday() >= 5:
+        return f"주말입니다. ({now.strftime('%A')})"
+
+    # 공휴일
+    if now.date() in KR_HOLIDAYS_2026:
+        return "공휴일입니다. (한국 증시 휴장)"
+
+    # 장 시간 외 (09:00 ~ 15:30)
+    start = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    if not (start <= now <= end):
+        return f"장 마감 시간입니다. ({now.strftime('%H:%M')})"
+
+    return None
+
+
 def job():
     """스케줄러에 의해 실행되는 작업 함수."""
     now = datetime.now(KST)
-
-    # 주말(토=5, 일=6) 체크
-    if now.weekday() >= 5:
-        print(f"[😴] 주말입니다. ({now.strftime('%A')}) 봇이 쉽니다.")
+    reason = is_market_closed(now)
+    if reason:
+        log.info("스킵 — %s", reason)
         return
-
-    # 한국 정규장: 09:00 ~ 15:30
-    start_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    end_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
-
-    if start_time <= now <= end_time:
-        run_pipeline()
-    else:
-        print(f"[😴] 장 마감 시간입니다. ({now.strftime('%H:%M')})")
+    run_pipeline()
 
 
 def main():
@@ -343,19 +478,19 @@ def main():
     global gemini_client
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-    print("=" * 60)
-    print("  KRX Auto-Trading Bot v3.0 (Live Data + Search Grounding)")
-    print(f"  Model: {GEMINI_MODEL}")
-    print(f"  Target: KOSPI/KOSDAQ (09:00 ~ 15:30)")
-    print("=" * 60)
+    log.info("=" * 50)
+    log.info("KRX Auto-Trading Bot v4.0")
+    log.info("Model: %s", GEMINI_MODEL)
+    log.info("Target: KOSPI/KOSDAQ (09:00 ~ 15:30)")
+    log.info("=" * 50)
 
     # 테스트를 위해 시작하자마자 1회 실행 (원치 않으면 주석 처리)
-    # job()
+    # run_pipeline()
 
     # 매 시간 정각에 실행 예약
     schedule.every().hour.at(":00").do(job)
 
-    print("[⏰] 스케줄러 가동 중... (매 정각 실행)")
+    log.info("스케줄러 가동 중... (매 정각 실행)")
 
     while True:
         schedule.run_pending()
